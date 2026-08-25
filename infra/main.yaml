@@ -1,0 +1,1133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: D4Sign MCP production stack on ECS Fargate.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: d4sign-mcp
+    AllowedPattern: '^[a-z][a-z0-9-]{2,17}$'
+  ImageUri:
+    Type: String
+    Description: Immutable ECR image URI, preferably pinned by digest.
+  PublicBaseUrl:
+    Type: String
+    AllowedPattern: '^https://[^/]+$'
+  AllowedHosts:
+    Type: String
+  AllowedOrigins:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  CertificateArn:
+    Type: String
+  CognitoDomainPrefix:
+    Type: String
+    AllowedPattern: '^[a-z0-9-]{3,63}$'
+  OAuthCallbackUrls:
+    Type: CommaDelimitedList
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+  MaxCount:
+    Type: Number
+    Default: 5
+    MinValue: 2
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.small
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [30, 60, 90, 120, 150, 180, 365]
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: E-mail assinante dos alarmes. Vazio cria o tópico sem assinatura.
+  WafRateLimitPerFiveMinutes:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    Description: Requisições por IP em 5 minutos antes do bloqueio no ALB.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${NamePrefix}-alarms
+      KmsMasterKeyId: alias/aws/sns
+
+  AlarmTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for D4Sign MCP secrets, S3 and ElastiCache.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${NamePrefix}-data
+      TargetKeyId: !Ref DataKey
+
+  RequestStateSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${NamePrefix}/request-state-key
+      KmsKeyId: !GetAtt DataKey.Arn
+      GenerateSecretString:
+        GenerateStringKey: value
+        PasswordLength: 64
+        ExcludePunctuation: true
+        SecretStringTemplate: '{}'
+
+  RedisAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${NamePrefix}/redis-auth
+      KmsKeyId: !GetAtt DataKey.Arn
+      GenerateSecretString:
+        GenerateStringKey: password
+        PasswordLength: 48
+        ExcludePunctuation: true
+        SecretStringTemplate: '{"username":"d4sign-mcp"}'
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTemporaryUploads
+            Prefix: uploads/
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+
+  GuardDutyScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: malware-protection-plan.guardduty.amazonaws.com
+            Action: sts:AssumeRole
+            # Sem condição de origem, qualquer plano de qualquer conta poderia
+            # assumir esta role (confused deputy).
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:malware-protection-plan/*
+      Policies:
+        - PolicyName: GuardDutyS3MalwareScan
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageGuardDutyEventRule
+                Effect: Allow
+                Action: [events:PutRule, events:DeleteRule, events:PutTargets, events:RemoveTargets]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*
+                Condition:
+                  StringLike:
+                    events:ManagedBy: malware-protection-plan.guardduty.amazonaws.com
+              - Sid: InspectGuardDutyEventRule
+                Effect: Allow
+                Action: [events:DescribeRule, events:ListTargetsByRule]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*
+              - Sid: TagScanResults
+                Effect: Allow
+                Action: [s3:PutObjectTagging, s3:GetObjectTagging, s3:PutObjectVersionTagging, s3:GetObjectVersionTagging]
+                Resource: !Sub ${UploadBucket.Arn}/uploads/*
+              - Sid: ConfigureBucketEvents
+                Effect: Allow
+                Action: [s3:PutBucketNotification, s3:GetBucketNotification]
+                Resource: !GetAtt UploadBucket.Arn
+              - Sid: ValidateProtectionPlan
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${UploadBucket.Arn}/malware-protection-resource-validation-object
+              - Sid: CheckBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt UploadBucket.Arn
+              - Sid: ScanObjects
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub ${UploadBucket.Arn}/uploads/*
+              - Sid: UseBucketEncryptionKey
+                Effect: Allow
+                Action: [kms:GenerateDataKey, kms:Decrypt]
+                Resource: !GetAtt DataKey.Arn
+                Condition:
+                  StringLike:
+                    kms:ViaService: !Sub s3.${AWS::Region}.${AWS::URLSuffix}
+
+  MalwareProtectionPlan:
+    Type: AWS::GuardDuty::MalwareProtectionPlan
+    Properties:
+      Role: !GetAtt GuardDutyScanRole.Arn
+      ProtectedResource:
+        S3Bucket:
+          BucketName: !Ref UploadBucket
+          ObjectPrefixes: [uploads/]
+      Actions:
+        Tagging:
+          Status: ENABLED
+      Tags:
+        - Key: managed-by
+          Value: d4sign-mcp
+
+  UploadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt UploadBucket.Arn
+              - !Sub ${UploadBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyUnscannedObjectReads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub ${UploadBucket.Arn}/uploads/*
+            Condition:
+              StringNotEquals:
+                s3:ExistingObjectTag/GuardDutyMalwareScanStatus: NO_THREATS_FOUND
+              ArnNotEquals:
+                aws:PrincipalArn: !GetAtt GuardDutyScanRole.Arn
+
+  CognitoScopePolicyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${NamePrefix}-scope-policy
+      RetentionInDays: !Ref LogRetentionDays
+
+  CognitoScopePolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFunctionLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NamePrefix}-scope-policy:*
+
+  CognitoScopePolicyFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CognitoScopePolicyLogGroup
+    Properties:
+      FunctionName: !Sub ${NamePrefix}-scope-policy
+      Description: Restricts D4Sign MCP OAuth scopes according to Cognito groups.
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt CognitoScopePolicyRole.Arn
+      MemorySize: 128
+      Timeout: 5
+      Code:
+        ZipFile: |
+          'use strict';
+
+          const SCOPE_PREFIX = 'd4sign-mcp/';
+          const CREDENTIAL_SCOPE = 'd4sign:credentials:write';
+          const ADMIN_SCOPE = 'd4sign:users:admin';
+
+          exports.handler = async (event) => {
+            const requested = Array.isArray(event.request?.scopes)
+              ? event.request.scopes
+              : [];
+            const groups = new Set(
+              event.request?.groupConfiguration?.groupsToOverride ?? [],
+            );
+            const isAdmin = groups.has('d4sign-admins');
+            const isOperator = groups.has('d4sign-operators');
+            const isReader = groups.has('d4sign-readers');
+
+            const isAllowed = (scope) => {
+              if (!scope.startsWith(SCOPE_PREFIX)) return true;
+
+              const internalScope = scope.slice(SCOPE_PREFIX.length);
+              if (internalScope === CREDENTIAL_SCOPE) return true;
+              if (isAdmin) return true;
+              if (isOperator) return internalScope !== ADMIN_SCOPE;
+              if (isReader) {
+                return (
+                  internalScope.endsWith(':read') ||
+                  internalScope.endsWith(':download')
+                );
+              }
+              return false;
+            };
+
+            event.response = {
+              claimsAndScopeOverrideDetails: {
+                accessTokenGeneration: {
+                  scopesToSuppress: requested.filter(
+                    (scope) => !isAllowed(scope),
+                  ),
+                },
+              },
+            };
+            return event;
+          };
+
+  CognitoScopePolicyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CognitoScopePolicyFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${AWS::Region}_*
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    DependsOn: CognitoScopePolicyInvokePermission
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub ${NamePrefix}-users
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      # Este pool autoriza cancelamento irreversível e bloqueio de usuário.
+      MfaConfiguration: 'ON'
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+      LambdaConfig:
+        PreTokenGenerationConfig:
+          LambdaArn: !GetAtt CognitoScopePolicyFunction.Arn
+          LambdaVersion: V2_0
+
+  CognitoReadersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: d4sign-readers
+      Description: Read-only D4Sign MCP operations and own credential management.
+      Precedence: 30
+
+  CognitoOperatorsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: d4sign-operators
+      Description: D4Sign MCP operations except D4Sign user administration.
+      Precedence: 20
+
+  CognitoAdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: d4sign-admins
+      Description: Full D4Sign MCP access including D4Sign user administration.
+      Precedence: 10
+
+  CognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: d4sign-mcp
+      Name: D4Sign MCP
+      Scopes:
+        - {ScopeName: 'd4sign:vaults:read', ScopeDescription: Read D4Sign vaults}
+        - {ScopeName: 'd4sign:vaults:write', ScopeDescription: Write D4Sign vaults}
+        - {ScopeName: 'd4sign:documents:read', ScopeDescription: Read D4Sign documents}
+        - {ScopeName: 'd4sign:documents:write', ScopeDescription: Write D4Sign documents}
+        - {ScopeName: 'd4sign:documents:download', ScopeDescription: Download D4Sign documents}
+        - {ScopeName: 'd4sign:documents:send', ScopeDescription: Send D4Sign documents}
+        - {ScopeName: 'd4sign:documents:cancel', ScopeDescription: Cancel D4Sign documents}
+        - {ScopeName: 'd4sign:signers:read', ScopeDescription: Read D4Sign signers}
+        - {ScopeName: 'd4sign:signers:write', ScopeDescription: Write D4Sign signers}
+        - {ScopeName: 'd4sign:users:read', ScopeDescription: Read D4Sign users}
+        - {ScopeName: 'd4sign:users:admin', ScopeDescription: Administer D4Sign users}
+        - {ScopeName: 'd4sign:tags:read', ScopeDescription: Read D4Sign tags}
+        - {ScopeName: 'd4sign:tags:write', ScopeDescription: Write D4Sign tags}
+        - {ScopeName: 'd4sign:observers:read', ScopeDescription: Read D4Sign observers}
+        - {ScopeName: 'd4sign:observers:write', ScopeDescription: Write D4Sign observers}
+        - {ScopeName: 'd4sign:webhooks:read', ScopeDescription: Read D4Sign webhooks}
+        - {ScopeName: 'd4sign:credentials:write', ScopeDescription: Manage own D4Sign credentials}
+
+  CognitoAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoResourceServer
+    Properties:
+      ClientName: !Sub ${NamePrefix}-public-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      SupportedIdentityProviders: [COGNITO]
+      # Sem ExplicitAuthFlows o Cognito aplica defaults legados. Aqui só SRP e
+      # refresh: nenhum fluxo de senha direta.
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      CallbackURLs: !Ref OAuthCallbackUrls
+      LogoutURLs: !Ref OAuthCallbackUrls
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - d4sign-mcp/d4sign:vaults:read
+        - d4sign-mcp/d4sign:vaults:write
+        - d4sign-mcp/d4sign:documents:read
+        - d4sign-mcp/d4sign:documents:write
+        - d4sign-mcp/d4sign:documents:download
+        - d4sign-mcp/d4sign:documents:send
+        - d4sign-mcp/d4sign:documents:cancel
+        - d4sign-mcp/d4sign:signers:read
+        - d4sign-mcp/d4sign:signers:write
+        - d4sign-mcp/d4sign:users:read
+        - d4sign-mcp/d4sign:users:admin
+        - d4sign-mcp/d4sign:tags:read
+        - d4sign-mcp/d4sign:tags:write
+        - d4sign-mcp/d4sign:observers:read
+        - d4sign-mcp/d4sign:observers:write
+        - d4sign-mcp/d4sign:webhooks:read
+        - d4sign-mcp/d4sign:credentials:write
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  CognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref CognitoUserPool
+      ManagedLoginVersion: 2
+
+  RedisParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupFamily: redis7
+      Description: Estado do D4Sign MCP sem eviction silenciosa.
+      Properties:
+        # Todas as chaves da aplicação têm TTL, inclusive as de anti-replay MRTR
+        # e de cota. Com a política default (volatile-lru), pressão de memória
+        # poderia evictar um consumo de confirmação e liberar replay de uma
+        # operação sensível. `noeviction` transforma isso em erro explícito.
+        maxmemory-policy: noeviction
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Private subnets for D4Sign MCP state.
+      SubnetIds: !Ref PrivateSubnetIds
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache ingress from D4Sign MCP tasks only.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: 255
+          ToPort: 255
+          CidrIp: 127.0.0.1/32
+          Description: Sem egress necessário
+
+  RedisDisabledDefaultUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: redis
+      UserId: !Sub ${NamePrefix}-default
+      UserName: default
+      AccessString: 'off ~* -@all'
+      AuthenticationMode:
+        Type: no-password-required
+
+  RedisApplicationUser:
+    Type: AWS::ElastiCache::User
+    Properties:
+      Engine: redis
+      UserId: !Sub ${NamePrefix}-app
+      UserName: d4sign-mcp
+      AccessString: 'on ~d4sign-mcp:* -@all +get +set +scan +del +eval +pttl +incrby +incr +pexpire +hello +quit +ping +echo'
+      AuthenticationMode:
+        Type: password
+        Passwords:
+          - !Sub '{{resolve:secretsmanager:${RedisAuthSecret}:SecretString:password}}'
+
+  RedisUserGroup:
+    Type: AWS::ElastiCache::UserGroup
+    Properties:
+      Engine: redis
+      UserGroupId: !Sub ${NamePrefix}-users
+      UserIds:
+        - !Ref RedisDisabledDefaultUser
+        - !Ref RedisApplicationUser
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${NamePrefix}-state
+      ReplicationGroupDescription: Distributed state for D4Sign MCP.
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: !Ref RedisNodeType
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref RedisSecurityGroup]
+      UserGroupIds: [!Ref RedisUserGroup]
+      CacheParameterGroupName: !Ref RedisParameterGroup
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      KmsKeyId: !GetAtt DataKey.Arn
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: required
+      SnapshotRetentionLimit: 7
+      AutoMinorVersionUpgrade: true
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${NamePrefix}
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: InjectRuntimeSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref RequestStateSecret
+                  - !Ref RedisAuthSecret
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt DataKey.Arn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: D4SignCredentials
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:RestoreSecret
+                  - secretsmanager:TagResource
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${NamePrefix}/credentials/*
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt DataKey.Arn
+        - PolicyName: TemporaryUploads
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt UploadBucket.Arn
+              # DeleteObjectVersion permite remover o conteúdo em definitivo em
+              # vez de apenas criar um delete marker sobre um bucket versionado.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectTagging
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub ${UploadBucket.Arn}/uploads/*
+
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # O ALB grava logs com SSE-S3; SSE-KMS com chave gerenciada não é aceito.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAlbLogDelivery
+            Effect: Allow
+            Principal: {Service: logdelivery.elasticloadbalancing.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub ${AccessLogBucket.Arn}/alb/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub ${AccessLogBucket.Arn}/*
+            Condition:
+              Bool: {aws:SecureTransport: false}
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTPS ingress for D4Sign MCP.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: D4Sign MCP Fargate tasks.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      # Egress explícito: HTTPS para D4Sign/AWS e a porta do ElastiCache.
+      # Sem isto o default do EC2 libera todo o tráfego de saída.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: D4Sign, Cognito JWKS, ECR, Secrets Manager, S3, CloudWatch
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          DestinationSecurityGroupId: !Ref RedisSecurityGroup
+          Description: Amazon ElastiCache
+
+  RedisIngressFromTasks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${NamePrefix}-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      Subnets: !Ref PublicSubnetIds
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: deletion_protection.enabled
+          Value: 'true'
+        - Key: routing.http.desync_mitigation_mode
+          Value: strictest
+        # As rodadas de confirmação MRTR duram até 10 minutos. O keep-alive SSE
+        # de 15 s já mantém a conexão viva, mas o timeout explícito remove a
+        # dependência desse detalhe do SDK.
+        - Key: idle_timeout.timeout_seconds
+          Value: '600'
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref AccessLogBucket
+        - Key: access_logs.s3.prefix
+          Value: alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${NamePrefix}-tg
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 3000
+      TargetType: ip
+      HealthCheckPath: /health/ready
+      HealthCheckProtocol: HTTP
+      Matcher: {HttpCode: '200'}
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates: [{CertificateArn: !Ref CertificateArn}]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${NamePrefix}-waf
+      Scope: REGIONAL
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${NamePrefix}-waf
+      Rules:
+        # Limite por IP na borda: o servidor também limita, mas ali o custo de
+        # validar JWT já foi pago.
+        - Name: RateLimitPerIp
+          Priority: 0
+          Action: {Block: {}}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafRateLimitPerFiveMinutes
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+        - Name: AmazonIpReputation
+          Priority: 1
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AmazonIpReputation
+        - Name: KnownBadInputs
+          Priority: 2
+          OverrideAction: {None: {}}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputs
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${NamePrefix}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref NamePrefix
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: d4sign-mcp
+          Image: !Ref ImageUri
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - {Name: NODE_ENV, Value: production}
+            - {Name: HOST, Value: 0.0.0.0}
+            - {Name: PORT, Value: '3000'}
+            - {Name: MCP_PUBLIC_BASE_URL, Value: !Ref PublicBaseUrl}
+            - {Name: MCP_ALLOWED_HOSTS, Value: !Ref AllowedHosts}
+            - {Name: MCP_ALLOWED_ORIGINS, Value: !Ref AllowedOrigins}
+            - {Name: MCP_AUTH_MODE, Value: oidc}
+            - Name: OIDC_ISSUER
+              Value: !Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${CognitoUserPool}
+            # Access token do Amazon Cognito NÃO possui claim `aud`, e a Lambda
+            # Pre Token Generation não pode adicioná-lo (claim reservado). O
+            # Cognito também não implementa RFC 8707, então `resource` é
+            # ignorado. O vínculo do token com este recurso é feito pelo client
+            # ID autorizado somado a `token_use=access`, validados no servidor.
+            - Name: OIDC_ALLOWED_CLIENT_IDS
+              Value: !Ref CognitoAppClient
+            - {Name: OIDC_SCOPE_PREFIX, Value: d4sign-mcp}
+            - {Name: D4SIGN_CREDENTIAL_BACKEND, Value: aws-secrets-manager}
+            - Name: AWS_CREDENTIALS_SECRET_PREFIX
+              Value: !Sub ${NamePrefix}/credentials
+            - {Name: AWS_CREDENTIALS_KMS_KEY_ID, Value: !GetAtt DataKey.Arn}
+            - {Name: MCP_STATE_BACKEND, Value: redis}
+            - Name: AWS_REDIS_URL
+              Value: !Sub
+                - rediss://${Endpoint}:${Port}
+                - Endpoint: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+                  Port: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Port
+            - {Name: AWS_REDIS_USERNAME, Value: d4sign-mcp}
+            - {Name: MCP_UPLOAD_BACKEND, Value: s3}
+            - {Name: AWS_S3_BUCKET, Value: !Ref UploadBucket}
+            - {Name: AWS_S3_PREFIX, Value: uploads}
+            - {Name: AWS_S3_REQUIRE_CLEAN_SCAN, Value: 'true'}
+            - {Name: AWS_REGION, Value: !Ref AWS::Region}
+            - {Name: D4SIGN_ENVIRONMENT, Value: production}
+            - {Name: D4SIGN_REQUESTS_PER_HOUR, Value: '1000'}
+            - {Name: MCP_SHUTDOWN_GRACE_MS, Value: '20000'}
+            - {Name: D4SIGN_CREDENTIAL_CACHE_TTL_MS, Value: '30000'}
+          Secrets:
+            - Name: MCP_REQUEST_STATE_KEY
+              ValueFrom: !Sub '${RequestStateSecret}:value::'
+            - Name: AWS_REDIS_PASSWORD
+              ValueFrom: !Sub '${RedisAuthSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: d4sign-mcp
+          # Precisa exceder MCP_SHUTDOWN_GRACE_MS para que a drenagem termine
+          # antes do SIGKILL do agente ECS.
+          StopTimeout: 40
+          HealthCheck:
+            Command: [CMD-SHELL, "node -e \"fetch('http://127.0.0.1:3000/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      ServiceName: !Sub ${NamePrefix}-service
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableExecuteCommand: false
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          Subnets: !Ref PrivateSubnetIds
+      LoadBalancers:
+        - ContainerName: d4sign-mcp
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+  ServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: !Ref MaxCount
+      ResourceId: !Sub service/${NamePrefix}-cluster/${NamePrefix}-service
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+    DependsOn: EcsService
+
+  ServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${NamePrefix}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Elevated D4Sign MCP ALB 5xx responses.
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  UnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: D4Sign MCP has unhealthy targets.
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+
+  Alb4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Volume anormal de 401/403/429 no D4Sign MCP.
+      AlarmActions: [!Ref AlarmTopic]
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_4XX_Count
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Latência p95 do D4Sign MCP acima do esperado.
+      AlarmActions: [!Ref AlarmTopic]
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      ExtendedStatistic: p95
+      Dimensions:
+        - {Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName}
+        - {Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName}
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RedisMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      # Com maxmemory-policy=noeviction, memória cheia vira erro de escrita:
+      # este alarme precisa disparar antes disso.
+      AlarmDescription: Memória do ElastiCache do D4Sign MCP próxima do limite.
+      AlarmActions: [!Ref AlarmTopic]
+      Namespace: AWS/ElastiCache
+      MetricName: DatabaseMemoryUsagePercentage
+      Dimensions:
+        - {Name: ReplicationGroupId, Value: !Ref RedisReplicationGroup}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RedisEvictionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Eviction no ElastiCache indica risco de replay MRTR e bypass de cota.
+      AlarmActions: [!Ref AlarmTopic]
+      Namespace: AWS/ElastiCache
+      MetricName: Evictions
+      Dimensions:
+        - {Name: ReplicationGroupId, Value: !Ref RedisReplicationGroup}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  MalwareScanFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Falhas de scan antimalware bloqueiam uploads legítimos.
+      AlarmActions: [!Ref AlarmTopic]
+      Namespace: AWS/GuardDuty
+      MetricName: FailedScanCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  MalwareInfectedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Upload infectado detectado no bucket temporário.
+      AlarmActions: [!Ref AlarmTopic]
+      Namespace: AWS/GuardDuty
+      MetricName: InfectedScanCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoIssuer:
+    Value: !Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${CognitoUserPool}
+  CognitoClientId:
+    Value: !Ref CognitoAppClient
+  CognitoHostedUiDomain:
+    Value: !Sub https://${CognitoDomain}.auth.${AWS::Region}.amazoncognito.com
+  CognitoAuthorizationGroups:
+    Value: d4sign-readers,d4sign-operators,d4sign-admins
+  UploadBucketName:
+    Value: !Ref UploadBucket
+  MalwareProtectionPlanId:
+    Value: !GetAtt MalwareProtectionPlan.MalwareProtectionPlanId
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  EcsServiceName:
+    Value: !GetAtt EcsService.Name
+  CognitoAllowedClientId:
+    Description: Client ID exigido no access token; o servidor rejeita outros.
+    Value: !Ref CognitoAppClient
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  AccessLogBucketName:
+    Value: !Ref AccessLogBucket
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn

@@ -1,0 +1,88 @@
+name: Deploy AWS ECS Fargate
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+        default: staging
+        required: true
+
+concurrency:
+  group: d4sign-mcp-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # O deploy repete as portas de qualidade: um workflow_dispatch pode partir
+      # de um commit que nunca passou pelo CI.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - name: Validate CloudFormation
+        run: pip install cfn-lint && cfn-lint infra/main.yaml
+      - name: Assume AWS deploy role through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push immutable image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+          TAG: ${{ github.sha }}
+        run: |
+          docker build --tag "$REGISTRY/$REPOSITORY:$TAG" .
+          docker push "$REGISTRY/$REPOSITORY:$TAG"
+          DIGEST=$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids imageTag="$TAG" --query 'imageDetails[0].imageDigest' --output text)
+          echo "uri=$REGISTRY/$REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Deploy CloudFormation stack
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name "${{ vars.AWS_STACK_NAME }}" \
+            --template-file infra/main.yaml \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              NamePrefix="${{ vars.AWS_NAME_PREFIX }}" \
+              ImageUri="$IMAGE_URI" \
+              PublicBaseUrl="${{ vars.MCP_PUBLIC_BASE_URL }}" \
+              AllowedHosts="${{ vars.MCP_ALLOWED_HOSTS }}" \
+              AllowedOrigins="${{ vars.MCP_ALLOWED_ORIGINS }}" \
+              VpcId="${{ vars.AWS_VPC_ID }}" \
+              PublicSubnetIds="${{ vars.AWS_PUBLIC_SUBNET_IDS }}" \
+              PrivateSubnetIds="${{ vars.AWS_PRIVATE_SUBNET_IDS }}" \
+              CertificateArn="${{ vars.AWS_ACM_CERTIFICATE_ARN }}" \
+              CognitoDomainPrefix="${{ vars.AWS_COGNITO_DOMAIN_PREFIX }}" \
+              OAuthCallbackUrls="${{ vars.MCP_OAUTH_CALLBACK_URLS }}" \
+              AlarmEmail="${{ vars.MCP_ALARM_EMAIL }}"
+      - name: Smoke test público
+        run: |
+          BASE="${{ vars.MCP_PUBLIC_BASE_URL }}"
+          # Readiness precisa responder 200; se degradar, o deploy não vale.
+          curl --fail --silent --show-error --max-time 20 "$BASE/health/ready" | tee /dev/stderr | grep -q '"status":"ready"'
+          # Metadata OAuth precisa anunciar o recurso correto.
+          curl --fail --silent --show-error --max-time 20 "$BASE/.well-known/oauth-protected-resource" \
+            | grep -q "\"resource\":\"$BASE/mcp\""
+          # MCP sem token precisa ser 401 com resource_metadata, nunca 200.
+          STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 20 -X POST "$BASE/mcp" -d '{}')
+          test "$STATUS" = "401" || { echo "POST /mcp devolveu $STATUS, esperado 401"; exit 1; }

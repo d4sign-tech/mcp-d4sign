@@ -1,0 +1,47 @@
+# Dependências e build
+node_modules/
+dist/
+*.tsbuildinfo
+*.tgz
+
+# Segredos e credenciais — .env.example é a única exceção
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+.aws/
+
+# Documentos internos, não versionados neste repositório
+D4Sign_MCP_SKILL.md
+code-review-*.md
+
+# Testes, cache e cobertura
+coverage/
+.vite/
+.vitest/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Temporários
+tmp/
+.tmp/
+scratch/
+*.local
+
+# Editor e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code — configuração local da máquina
+.claude/settings.local.json
