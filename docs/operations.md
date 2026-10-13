@@ -83,6 +83,18 @@ Depois do deploy:
 5. teste a metadata OAuth e faça uma chamada autenticada de ponta a ponta;
 6. confirme no token emitido que `client_id` é o valor de `CognitoAllowedClientId` e que `token_use` é `access`.
 
+## Liberação da metadata para ferramentas de IA
+
+`OIDC_METADATA_FACADE` vem **desligada por padrão**, então publicar a imagem nova não altera o comportamento. A ordem segura:
+
+1. Publicar a imagem e atualizar o serviço. Nada muda para quem já usa.
+2. Rodar `node scripts/verify-mcp-oauth-metadata.mjs https://<dominio>` e anotar as duas falhas esperadas (PKCE e `grant_types_supported`).
+3. Nova revisão da task definition com `OIDC_METADATA_FACADE=true`.
+4. Rodar o verificador de novo: precisa terminar sem falhas.
+5. Conferir que um login existente continua funcionando (`tmp/testar-producao.mjs`).
+
+Reversão: voltar `OIDC_METADATA_FACADE` para `false` e atualizar o serviço. Os tokens já emitidos continuam válidos, porque a emissão nunca saiu do Cognito.
+
 ## Usuários e grupos do Cognito
 
 A stack provisiona `d4sign-readers`, `d4sign-operators` e `d4sign-admins`. Usuários sem grupo só recebem `d4sign:credentials:write`, suficiente para cadastrar ou rotacionar a própria conta D4Sign sem acesso às tools. Conceda o menor grupo necessário:

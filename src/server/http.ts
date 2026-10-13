@@ -10,6 +10,7 @@ import { SCOPES } from '../auth/scopes.js';
 import { UploadError } from '../d4sign/errors.js';
 import { validateUploadFile } from '../d4sign/file-validation.js';
 import { InMemoryRateLimiter, type RateLimiter } from '../infra/rate-limiter.js';
+import { AuthorizationServerMetadata, advertisedScopes, isMetadataFacadeEnabled } from './authorization-server-metadata.js';
 import { normalizeRequestId, runWithRequestContext } from '../infra/request-context.js';
 import type { ServerDependencies } from './dependencies.js';
 import { buildServer } from './build-server.js';
@@ -101,22 +102,45 @@ function protectedResourceMetadata(config: AppConfig, req: IncomingMessage): Rec
   const requestBase = `http://${req.headers.host ?? 'localhost'}`;
   const base = config.publicBaseUrl ?? requestBase;
   const resource = `${base}/mcp`;
-  const authorizationServer = config.oidc?.issuer ?? base;
+  // Com a camada de metadata ativa, o authorization server anunciado é esta
+  // origem: é ela que publica PKCE, que o provedor real não declara.
+  const facade = isMetadataFacadeEnabled(config);
+  const authorizationServer = facade ? base : (config.oidc?.issuer ?? base);
   const scopePrefix = config.oidc?.scopePrefix;
   return {
     resource,
     authorization_servers: [authorizationServer],
     scopes_supported: scopePrefix === undefined
       ? []
-      : [...new Set(Object.values(SCOPES).map((scope) => scopePrefix.length === 0
-        ? scope
-        : `${scopePrefix}/${scope}`))],
+      : facade
+        ? advertisedScopes(scopePrefix)
+        : [...new Set(Object.values(SCOPES).map((scope) => scopePrefix.length === 0
+          ? scope
+          : `${scopePrefix}/${scope}`))],
     bearer_methods_supported: ['header'],
   };
 }
 
-export function createHttpServer(config: AppConfig, dependencies: ServerDependencies): Server {
+export interface HttpServerOptions {
+  /** Cliente HTTP usado para consultar a metadata do provedor de identidade. */
+  fetchImpl?: typeof fetch;
+}
+
+export function createHttpServer(
+  config: AppConfig,
+  dependencies: ServerDependencies,
+  options: HttpServerOptions = {},
+): Server {
   const tokenVerifier = createAccessTokenVerifier(config);
+  const authorizationServerMetadata = isMetadataFacadeEnabled(config) && config.oidc !== undefined && config.publicBaseUrl !== undefined
+    ? new AuthorizationServerMetadata({
+      issuer: config.publicBaseUrl,
+      upstreamIssuer: config.oidc.issuer,
+      scopePrefix: config.oidc.scopePrefix,
+      logger: dependencies.logger,
+      ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+    })
+    : undefined;
   const rateLimiter: RateLimiter = dependencies.rateLimiter ?? new InMemoryRateLimiter();
 
   const validateHost = hostHeaderValidation(config.allowedHosts);
@@ -178,6 +202,18 @@ export function createHttpServer(config: AppConfig, dependencies: ServerDependen
           || pathname === '/.well-known/oauth-protected-resource/mcp')
       ) {
         writeJson(res, 200, protectedResourceMetadata(config, req), { 'Cache-Control': 'public, max-age=300' });
+        return;
+      }
+      if (
+        req.method === 'GET'
+        && pathname === '/.well-known/oauth-authorization-server'
+        && authorizationServerMetadata !== undefined
+      ) {
+        try {
+          writeJson(res, 200, await authorizationServerMetadata.get(), { 'Cache-Control': 'public, max-age=300' });
+        } catch {
+          writeJson(res, 503, { error: 'authorization_server_metadata_unavailable' }, { 'Retry-After': '30' });
+        }
         return;
       }
       if (pathname !== '/mcp' && pathname !== '/uploads' && pathname !== '/credentials/d4sign') {

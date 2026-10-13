@@ -30,6 +30,12 @@ export interface AppConfig {
     jwksUrl: string;
     scopePrefix: string;
     tenantClaim?: string;
+    /**
+     * Publica `/.well-known/oauth-authorization-server` com PKCE e aponta o
+     * recurso protegido para esta origem. Necessário com provedores que não
+     * declaram `code_challenge_methods_supported` (Amazon Cognito).
+     */
+    metadataFacade?: boolean;
   };
   requestStateKey?: string;
   mcpMaxBodyBytes: number;

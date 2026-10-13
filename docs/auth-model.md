@@ -56,6 +56,30 @@ O servidor publica `/.well-known/oauth-protected-resource` e responde 401 com `r
 
 Clientes MCP genéricos também precisam conhecer o client ID e o callback cadastrados. Com IdP que implementa RFC 8707, devem enviar `resource` com a URL exata do MCP; com Cognito, o parâmetro é ignorado e o vínculo é o próprio client ID. O Cognito não oferece Dynamic Client Registration irrestrito. Se o host não aceitar um cliente previamente registrado, é necessário um Authorization Server/proxy de onboarding à frente do Cognito.
 
+## Descoberta para ferramentas de IA
+
+Ferramentas como ChatGPT e Claude não recebem a configuração do login: elas a **descobrem**, seguindo a especificação de autorização do MCP.
+
+1. Chamam `/mcp` sem token e recebem `401` com `WWW-Authenticate: ... resource_metadata="..."`.
+2. Leem `/.well-known/oauth-protected-resource` e descobrem o authorization server.
+3. Leem a metadata do authorization server e **verificam que ele declara PKCE** (`code_challenge_methods_supported`). A revisão 2025-11-25 manda o cliente recusar quem não declara.
+
+O Amazon Cognito executa PKCE, mas não o declara, e também responde `400` ao caminho do RFC 8414. Por isso, com `OIDC_METADATA_FACADE=true`, este servidor:
+
+- aponta `authorization_servers` para a **própria origem pública**;
+- publica `/.well-known/oauth-authorization-server` com PKCE `S256`, `authorization_code` e `refresh_token`, copiando do Cognito os endpoints de login e de token;
+- anuncia apenas os scopes que uma ferramenta de IA pode obter. `d4sign:users:admin` e `d4sign:credentials:write` ficam de fora, tanto por menor privilégio quanto porque anunciar um scope que o client nega faz o host receber `invalid_scope`.
+
+Os tokens continuam sendo emitidos e assinados pelo Cognito, e o servidor continua validando issuer, client ID e scopes como antes. A camada só **descreve** o provedor.
+
+Limites conhecidos: não há registro dinâmico de cliente, então cada ferramenta usa um client ID configurado à mão; e o Cognito não aceita `offline_access`, então a duração da sessão depende de a ferramenta usar o refresh token que o Cognito já emite.
+
+Para conferir qualquer servidor MCP contra esses requisitos:
+
+```bash
+node scripts/verify-mcp-oauth-metadata.mjs https://mcp.d4sign.com.br
+```
+
 ## Onboarding das credenciais D4Sign
 
 O cadastro ocorre fora do chat:

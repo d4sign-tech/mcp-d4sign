@@ -9,7 +9,7 @@ export const SERVER_INSTRUCTIONS =
 
 export function buildServer(dependencies: ServerDependencies): McpServer {
   const server = new McpServer(
-    { name: 'd4sign-mcp', version: '0.3.0' },
+    { name: 'd4sign-mcp', version: '0.4.0' },
     {
       instructions: SERVER_INSTRUCTIONS,
       capabilities: { tools: {} },

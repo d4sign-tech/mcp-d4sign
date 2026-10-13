@@ -45,3 +45,10 @@ Thumbs.db
 
 # Claude Code — configuração local da máquina
 .claude/settings.local.json
+
+# Configuração MCP local (caminhos absolutos desta máquina)
+.mcp.json
+
+# Credenciais AWS baixadas do console
+*accessKeys*.csv
+*credentials*.csv

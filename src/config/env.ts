@@ -31,6 +31,7 @@ const EnvSchema = z
     OIDC_JWKS_URL: optionalNonEmptyString,
     OIDC_SCOPE_PREFIX: z.string().trim().default(''),
     OIDC_TENANT_CLAIM: optionalNonEmptyString,
+    OIDC_METADATA_FACADE: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
     MCP_REQUEST_STATE_KEY: z.preprocess(
       (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
       z.string().min(32, 'MCP_REQUEST_STATE_KEY deve ter pelo menos 32 bytes').optional(),
@@ -126,6 +127,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const allowedClientIds = commaSeparated(parsed.OIDC_ALLOWED_CLIENT_IDS);
 
+  if (parsed.OIDC_METADATA_FACADE && (parsed.MCP_AUTH_MODE !== 'oidc' || parsed.MCP_PUBLIC_BASE_URL === undefined)) {
+    throw new Error('OIDC_METADATA_FACADE=true exige MCP_AUTH_MODE=oidc e MCP_PUBLIC_BASE_URL.');
+  }
+
   if (parsed.MCP_AUTH_MODE === 'oidc') {
     if (parsed.OIDC_ISSUER === undefined) {
       throw new Error('OIDC_ISSUER é obrigatório quando MCP_AUTH_MODE=oidc.');
@@ -213,6 +218,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
               ?? `${requiredValue(oidcIssuer, 'OIDC_ISSUER').replace(/\/$/u, '')}/.well-known/jwks.json`,
             scopePrefix: parsed.OIDC_SCOPE_PREFIX.replace(/\/$/u, ''),
             ...(parsed.OIDC_TENANT_CLAIM === undefined ? {} : { tenantClaim: parsed.OIDC_TENANT_CLAIM }),
+            ...(parsed.OIDC_METADATA_FACADE ? { metadataFacade: true } : {}),
           },
         }
       : {}),

@@ -83,6 +83,10 @@ describe('infraestrutura AWS', () => {
     expect(template).not.toContain('Name: OIDC_AUDIENCE');
   });
 
+  it('publica a metadata de authorization server que o Cognito não declara', () => {
+    expect(template).toMatch(/Name: OIDC_METADATA_FACADE, Value: 'true'/u);
+  });
+
   it('impede eviction silenciosa do estado de segurança no ElastiCache', () => {
     // Chaves de anti-replay MRTR e de cota têm TTL; com volatile-lru, pressão de
     // memória poderia liberar replay de uma operação sensível.

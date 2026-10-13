@@ -877,6 +877,10 @@ Resources:
             - Name: OIDC_ALLOWED_CLIENT_IDS
               Value: !Ref CognitoAppClient
             - {Name: OIDC_SCOPE_PREFIX, Value: d4sign-mcp}
+            # O Cognito executa PKCE mas não o declara, e clientes MCP aderentes
+            # à especificação recusam provedor que não declara. O servidor
+            # publica a metadata completa e aponta os endpoints para o Cognito.
+            - {Name: OIDC_METADATA_FACADE, Value: 'true'}
             - {Name: D4SIGN_CREDENTIAL_BACKEND, Value: aws-secrets-manager}
             - Name: AWS_CREDENTIALS_SECRET_PREFIX
               Value: !Sub ${NamePrefix}/credentials
